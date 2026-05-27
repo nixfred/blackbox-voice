@@ -2,14 +2,27 @@
 # bbsync — dump UX570 (or any Sony IC RECORDER) → host blackbox pipeline.
 # Detects mounted recorder, prompts for tags, rsyncs to host:~/blackbox-incoming/.
 #
+# Two-stage transfer for crash safety:
+#   1. Copy device → local Mac staging dir (fast, USB-local; the ONLY step that
+#      needs the recorder plugged in).
+#   2. Verify the copy (file count + byte size).
+#   3. Offer to wipe the recorder — safe now, the files live on the Mac.
+#   4. rsync staging → host over the network (recorder no longer involved).
+#   5. Clear the .uploading flag, delete the local staging dir.
+# Unplug the recorder any time after step 3 and nothing is lost. If the network
+# push (step 4) dies, the staged session is left behind with a .pending-push
+# marker and pushed automatically on the next bbsync run — no device needed.
+#
 # Usage:
 #   bbsync                       Interactive: auto-detect mount, prompt for tags
 #   bbsync --source PATH         Override source directory
 #   bbsync --no-prompt           Skip tag prompt (no tags applied)
 #   bbsync --dry-run             Show what would happen, don't transfer
+#   bbsync --resume              Only push leftover staged sessions, then exit
 #
 # Configure: set BLACKBOX_HOST in your shell env (or ~/.ssh/config Host alias)
 # to the SSH target running bounce_blackbox.sh. Default: "blackbox-host".
+# Staging dir override: BLACKBOX_STAGING (default ~/.cache/blackbox/staging).
 
 set -euo pipefail
 
@@ -17,6 +30,13 @@ HOST="${BLACKBOX_HOST:-blackbox-host}"
 # Use relative path so rsync resolves to the remote user's $HOME automatically.
 # (Literal "$HOME" in rsync destinations is NOT expanded server-side.)
 HOST_INCOMING_REL="blackbox-incoming"
+# Local staging area on the Mac. One subdir per session. Persists across reboots
+# so an interrupted network push can resume.
+STAGING_BASE="${BLACKBOX_STAGING:-$HOME/.cache/blackbox/staging}"
+
+# Audio filter shared by the local copy and the network push (case-insensitive
+# on the device, but rsync patterns are literal — cover both cases explicitly).
+AUDIO_INCLUDES=(--include='*.mp3' --include='*.wav' --include='*.MP3' --include='*.WAV' --exclude='*')
 
 # Sony UX570 stores REC-button files in REC_FILE/FOLDER01..05 (default REC button mode)
 # and Scene/preset recordings under VOICE/FOLDER01..05. Probe deepest paths first.
@@ -31,21 +51,111 @@ DEFAULT_SOURCES=(
 SOURCE=""
 PROMPT=1
 DRYRUN=0
+RESUME=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source) SOURCE="$2"; shift 2 ;;
         --no-prompt) PROMPT=0; shift ;;
         --dry-run) DRYRUN=1; shift ;;
+        --resume) RESUME=1; shift ;;
         -h|--help)
-            sed -n '2,11p' "$0" | sed 's/^# \?//'
+            sed -n '2,21p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-# Auto-detect recorder if no source given
+count_audio() {  # count_audio DIR → number of mp3/wav files at top level
+    find "$1" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) 2>/dev/null | wc -l | tr -d ' '
+}
+
+# --- push_session: ship one staged dir to the host -----------------
+# Idempotent: safe to call again on a half-pushed session (rsync resumes,
+# mkdir -p / touch are no-ops). Removes the staging dir only on full success.
+push_session() {
+    local staging_dir="$1"
+    local session
+    session="$(basename "$staging_dir")"
+    local session_rel="$HOST_INCOMING_REL/$session"
+    local n
+    n=$(count_audio "$staging_dir")
+
+    echo "Pushing $session ($n file(s)) → $HOST ..."
+
+    local SSH_OPTS=(-o ConnectTimeout=10)
+    fail_msg() {
+        echo "Network push failed for $session ($1). Files are safe in:" >&2
+        echo "  $staging_dir" >&2
+        echo "Re-run 'bbsync' (or 'bbsync --resume') to retry — no recorder needed." >&2
+    }
+
+    # Atomic session-dir creation + .uploading flag in ONE ssh call so the bounce
+    # processor never sees a session_dir without the flag (it would otherwise
+    # process an empty dir, fire cleanup_session early, and strip tags.txt).
+    if ! ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p \"\$HOME/$session_rel\" && chmod 700 \"\$HOME/$session_rel\" && touch \"\$HOME/$session_rel/.uploading\""; then
+        fail_msg "session dir create"; return 1
+    fi
+
+    # Upload tags sidecar atomically (write .tmp + rename — guards partial writes
+    # if the ssh stream dies mid-cat). Same-FS rename is atomic on ext4/btrfs.
+    if [[ -f "$staging_dir/tags.txt" ]]; then
+        if ! ssh "${SSH_OPTS[@]}" "$HOST" "cat > \"\$HOME/$session_rel/tags.txt.tmp\" && mv \"\$HOME/$session_rel/tags.txt.tmp\" \"\$HOME/$session_rel/tags.txt\"" < "$staging_dir/tags.txt"; then
+            fail_msg "tags upload"; return 1
+        fi
+    fi
+
+    # Audio over the network — RELATIVE path so rsync expands to remote $HOME.
+    # -a preserves the device mtime carried through staging (keeps bounce's
+    # "modified <30s ago" guard from false-firing). The include filter excludes
+    # tags.txt and the .pending-push marker, so only audio transfers here.
+    if ! rsync -av --progress -e "ssh ${SSH_OPTS[*]}" "${AUDIO_INCLUDES[@]}" "$staging_dir"/ "$HOST:$session_rel/"; then
+        fail_msg "audio rsync"
+        echo ".uploading flag retained on $HOST; clear manually if abandoning:" >&2
+        echo "  ssh $HOST \"rm -f \\\$HOME/$session_rel/.uploading\"" >&2
+        return 1
+    fi
+
+    # Clear atomicity flag — bounce can now process this session.
+    if ! ssh "${SSH_OPTS[@]}" "$HOST" "rm -f \"\$HOME/$session_rel/.uploading\""; then
+        fail_msg "flag clear"; return 1
+    fi
+
+    # Success: drop the local staging copy (marker included).
+    rm -rf "$staging_dir"
+    echo "Pushed $session ($n file(s))."
+}
+
+# --- Recover any staged-but-unpushed sessions from a prior crash ----
+resume_pending() {
+    [[ -d "$STAGING_BASE" ]] || return 0
+    shopt -s nullglob
+    local found=0
+    for marker in "$STAGING_BASE"/session-*/.pending-push; do
+        local dir
+        dir="$(dirname "$marker")"
+        found=1
+        echo "Found un-pushed staged session: $(basename "$dir")"
+        if [[ "$DRYRUN" -eq 1 ]]; then
+            echo "  [DRY RUN] would push $(count_audio "$dir") file(s) to $HOST"
+            continue
+        fi
+        push_session "$dir" || echo "  (still pending — will retry next run)"
+    done
+    shopt -u nullglob
+    [[ "$found" -eq 0 ]] && return 0
+    echo ""
+}
+
+# --- Step 0: always try to drain leftover staged sessions first -----
+resume_pending
+if [[ "$RESUME" -eq 1 ]]; then
+    echo "Resume-only run complete."
+    exit 0
+fi
+
+# --- Step 1: locate the recorder ------------------------------------
 if [[ -z "$SOURCE" ]]; then
     for candidate in "${DEFAULT_SOURCES[@]}"; do
         if [[ -d "$candidate" ]] && find "$candidate" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -print -quit | grep -q .; then
@@ -62,8 +172,7 @@ if [[ -z "$SOURCE" || ! -d "$SOURCE" ]]; then
     exit 1
 fi
 
-# Count audio files
-file_count=$(find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) | wc -l | tr -d ' ')
+file_count=$(count_audio "$SOURCE")
 echo "Source: $SOURCE"
 echo "Found $file_count audio file(s)"
 
@@ -72,7 +181,7 @@ if [[ "$file_count" -eq 0 ]]; then
     exit 0
 fi
 
-# Tag prompt
+# --- Step 2: tag prompt ---------------------------------------------
 TAGS=""
 if [[ "$PROMPT" -eq 1 ]]; then
     echo ""
@@ -81,73 +190,87 @@ if [[ "$PROMPT" -eq 1 ]]; then
     read -r TAGS || TAGS=""
 fi
 
-# Build session ID
 SESSION="session-$(date -u +%Y%m%dT%H%M%SZ)"
-SESSION_REL="$HOST_INCOMING_REL/$SESSION"  # relative to remote $HOME
+STAGING_DIR="$STAGING_BASE/$SESSION"
 
 if [[ "$DRYRUN" -eq 1 ]]; then
     echo ""
     echo "[DRY RUN]"
     echo "  Session: $SESSION"
+    echo "  Stage to: $STAGING_DIR"
     echo "  Files:"
     find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -exec basename {} \; | sed 's/^/    /'
     [[ -n "$TAGS" ]] && echo "  Tags: $TAGS"
-    echo "  Destination: $HOST:~/$SESSION_REL/"
-    echo "[DRY RUN end — no files transferred]"
+    echo "  Then push to: $HOST:~/$HOST_INCOMING_REL/$SESSION/"
+    echo "[DRY RUN end — nothing copied or transferred]"
     exit 0
 fi
 
-# Atomic session-dir creation + .uploading flag. Combined into ONE ssh call so
-# the bounce processor can never observe a session_dir without the flag (closes
-# the residual race between separate mkdir and touch invocations — without it,
-# bounce could process an empty dir, prematurely fire cleanup_session, and strip
-# tags.txt). Flag is cleared AFTER rsync completes successfully. If bbsync
-# crashes mid-upload, the flag is left behind and visible via `bb status`.
+# --- Step 3: stage locally (the only step needing the recorder) -----
 echo ""
-echo "Creating $SESSION on $HOST..."
-ssh "$HOST" "mkdir -p \"\$HOME/$SESSION_REL\" && chmod 700 \"\$HOME/$SESSION_REL\" && touch \"\$HOME/$SESSION_REL/.uploading\""
+echo "Staging $file_count file(s) → $STAGING_DIR ..."
+mkdir -p "$STAGING_DIR"
+if ! rsync -a "${AUDIO_INCLUDES[@]}" "$SOURCE"/ "$STAGING_DIR"/; then
+    echo "Error: local copy from recorder failed. Recorder NOT modified." >&2
+    rm -rf "$STAGING_DIR"
+    exit 1
+fi
 
-# Upload tags sidecar atomically (write to .tmp + rename — guards against partial
-# writes if the ssh stream dies mid-cat). Same-FS rename is atomic on ext4/btrfs.
+# --- Step 4: verify the copy (count + byte size) before allowing wipe ---
+staged_count=$(count_audio "$STAGING_DIR")
+verify_ok=1
+if [[ "$staged_count" -ne "$file_count" ]]; then
+    echo "Error: staged $staged_count file(s) but device has $file_count." >&2
+    verify_ok=0
+fi
+while IFS= read -r -d '' f; do
+    bn="$(basename "$f")"
+    src_size=$(stat -f%z "$f" 2>/dev/null || echo -1)
+    dst_size=$(stat -f%z "$STAGING_DIR/$bn" 2>/dev/null || echo -2)
+    if [[ "$src_size" != "$dst_size" ]]; then
+        echo "Error: size mismatch for $bn (device=$src_size staged=$dst_size)." >&2
+        verify_ok=0
+    fi
+done < <(find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -print0)
+
+if [[ "$verify_ok" -ne 1 ]]; then
+    echo "Verification FAILED — leaving staging dir for inspection, NOT touching recorder:" >&2
+    echo "  $STAGING_DIR" >&2
+    exit 1
+fi
+echo "Verified: $staged_count file(s) copied intact."
+
+# Write the tags sidecar into the staging dir (captured now, travels with the
+# session — survives a crash so --resume still has the tags).
 if [[ -n "$TAGS" ]]; then
-    ssh "$HOST" "cat > \"\$HOME/$SESSION_REL/tags.txt.tmp\" && mv \"\$HOME/$SESSION_REL/tags.txt.tmp\" \"\$HOME/$SESSION_REL/tags.txt\"" <<EOF
+    cat > "$STAGING_DIR/tags.txt" <<EOF
 date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 operator: $USER
 host: $(hostname -s)
 source_mount: $SOURCE
 tags: $TAGS
 EOF
-    echo "Tags written."
 fi
 
-# Rsync audio files — RELATIVE path so rsync expands to remote user's $HOME
-echo "Uploading $file_count file(s)..."
-rsync -av --progress \
-    --include='*.mp3' --include='*.wav' --include='*.MP3' --include='*.WAV' --exclude='*' \
-    "$SOURCE"/ "$HOST:$SESSION_REL/" || {
-    echo "Rsync failed. Files remain on the recorder." >&2
-    echo ".uploading flag retained on $HOST for visibility — clear manually via:" >&2
-    echo "  ssh $HOST \"rm -f \\\$HOME/$SESSION_REL/.uploading\"" >&2
-    exit 1
-}
+# Mark staged + ready to push. From here a crash is fully recoverable: the next
+# bbsync run drains this via resume_pending() with no recorder attached.
+touch "$STAGING_DIR/.pending-push"
 
-# Clear atomicity flag — bounce can now process this session
-ssh "$HOST" "rm -f \"\$HOME/$SESSION_REL/.uploading\""
-
+# --- Step 5: offer to wipe the recorder — files are safe on the Mac now ---
 echo ""
-echo "Uploaded $file_count file(s) to $SESSION"
-echo ""
-
-# Offer to clean recorder. Tolerate non-tty / EOF stdin (piped invocations):
-# set -e would otherwise kill the script on read returning nonzero, leaving the
-# recorder un-wiped AND the script exit code falsely flagging upload failure.
-read -p "Delete files from recorder? [y/N] " del || del=""
+read -p "Files staged + verified. Delete from recorder now (safe to unplug after)? [y/N] " del || del=""
 if [[ "$del" =~ ^[Yy]$ ]]; then
     find "$SOURCE" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.wav' \) -delete
-    echo "Recorder cleaned."
+    echo "Recorder cleaned. Safe to unplug."
 else
-    echo "Recorder files retained. Delete manually via the device or Finder when ready."
+    echo "Recorder files retained. Safe to unplug — staged copy will still upload."
 fi
 
+# --- Step 6: push over the network (recorder no longer involved) ----
 echo ""
-echo "Pipeline will pick up within ~60s. Monitor: bb log"
+if push_session "$STAGING_DIR"; then
+    echo ""
+    echo "Done. Pipeline will pick up within ~60s. Monitor: bb log"
+else
+    exit 1
+fi
