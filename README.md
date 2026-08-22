@@ -1,4 +1,12 @@
+<div align="center">
+
+<img src="assets/readme/blackbox-hero.svg" alt="Audio moving from a pocket recorder through local Whisper transcription into a dated text archive while source audio is destroyed" width="100%">
+
 # blackbox-voice
+
+### Record the day. Keep the words. Destroy the audio.
+
+</div>
 
 A personal ambient-recording pipeline. Plug in a Sony IC Recorder at the end of the day, run one command, and wake up to a transcribed + summarized archive of your day. Everything stays on your own hardware except the daily summary call to Claude.
 
@@ -12,6 +20,17 @@ A personal ambient-recording pipeline. Plug in a Sony IC Recorder at the end of 
                                               bb (Mac/Linux CLI) → SSH-wrapped review
 ```
 
+```mermaid
+flowchart LR
+    REC["Sony recorder"] --> SYNC["bbsync on Mac"]
+    SYNC -->|"SSH + rsync"| HOST["Linux host"]
+    HOST --> WHISPER["whisper.cpp"]
+    WHISPER --> TEXT["transcript.md"]
+    WHISPER -->|"success only"| SHRED["shred audio"]
+    TEXT --> SUMMARY["nightly summary.md"]
+    TEXT --> CLI["bb review CLI"]
+```
+
 **Design goals.**
 - Audio never persists past transcription (shredded on success).
 - Transcripts + daily summary live in a date-tree archive on the host: `/data/blackbox/YYYY/MM/DD/`.
@@ -20,6 +39,23 @@ A personal ambient-recording pipeline. Plug in a Sony IC Recorder at the end of 
 - No API keys or third-party SaaS dependencies beyond what you already have (the daily summary uses your Claude Code Max subscription via the local CLI; if you don't have that, the rest of the pipeline still works).
 
 ## Components
+
+```mermaid
+flowchart TB
+    subgraph Client["Mac client"]
+      BBSYNC[bbsync upload + tags]
+      BB[bb search + review]
+    end
+    subgraph Host["Private Linux host"]
+      BOUNCE[60-second ingest timer]
+      DAILY[nightly summary timer]
+      ARCHIVE[(date-tree archive)]
+      BOUNCE --> ARCHIVE
+      DAILY --> ARCHIVE
+    end
+    BBSYNC --> BOUNCE
+    ARCHIVE --> BB
+```
 
 | File | Where it runs | Role |
 |---|---|---|
@@ -121,6 +157,22 @@ Host blackbox-host
 
 ## Daily flow
 
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant Recorder
+    participant Mac
+    participant Host
+    Operator->>Mac: plug in recorder + run bbsync
+    Mac->>Host: create .uploading + rsync audio
+    Mac->>Host: remove .uploading after success
+    Host->>Host: Whisper transcribes each file
+    Host->>Host: atomic transcript write
+    Host->>Host: shred audio after success
+    Host->>Host: nightly summary
+    Operator->>Host: review through bb
+```
+
 1. Plug the IC RECORDER into the Mac.
 2. `bbsync` — auto-detects the recorder, prompts for tags (free-form, see [`tag-vocab.md`](tag-vocab.md)), uploads.
 3. Optionally answer "yes" when bbsync asks to wipe the recorder.
@@ -180,6 +232,15 @@ bb status                          # pending sessions + in-flight uploads + last
 ```
 
 ## Privacy + security posture
+
+```mermaid
+flowchart LR
+    AUDIO["Audio"] -->|"local only"| WHISPER["whisper.cpp"]
+    WHISPER --> TRANSCRIPT["Private transcript archive"]
+    WHISPER -->|"success"| GONE["Audio shredded"]
+    TRANSCRIPT -.->|"optional nightly summary"| CLAUDE["Claude CLI"]
+    TRANSCRIPT -->|"SSH only"| OPERATOR["Operator"]
+```
 
 - `/data/blackbox/` is mode `700`, owned by your operator user. `_log` is `600`. Transcripts + summaries are `600`.
 - No encryption at rest. The pipeline assumes "host SSH access = archive access" — protect the SSH key on the client.
